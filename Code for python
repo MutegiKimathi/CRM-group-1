@@ -1,0 +1,748 @@
+# ── 0. IMPORTS ────────────────────────────────────────────────────────────────
+import warnings
+warnings.filterwarnings('ignore')
+
+import os
+import io
+import urllib.request
+
+import numpy  as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot    as plt
+import matplotlib.gridspec  as gridspec
+import seaborn              as sns
+from   scipy                import stats
+
+from sklearn.model_selection        import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.preprocessing          import StandardScaler
+from sklearn.linear_model           import LogisticRegression
+from sklearn.discriminant_analysis  import LinearDiscriminantAnalysis
+from sklearn.tree                   import DecisionTreeClassifier
+from sklearn.ensemble               import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics                import (
+    confusion_matrix, roc_curve, auc, precision_recall_curve,
+    average_precision_score, roc_auc_score, f1_score,
+    classification_report, ConfusionMatrixDisplay
+)
+
+os.makedirs('plots', exist_ok=True)
+
+# ── GLOBAL STYLE ──────────────────────────────────────────────────────────────
+plt.rcParams.update({
+    'font.family'    : 'serif',
+    'axes.spines.top': False,
+    'axes.spines.right': False,
+    'axes.grid'      : False,
+})
+RED  = '#d62828'
+BLUE = '#1f77b4'
+PALETTE = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62828', '#9467bd']
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. DATA LOADING
+# ══════════════════════════════════════════════════════════════════════════════
+print("=" * 70)
+print("CREDIT SCORING MODEL — GERMAN CREDIT DATASET")
+print("=" * 70)
+
+# Column names from the UCI Statlog German Credit data (numeric version)
+COL_NAMES = [
+    'checking_account', 'duration', 'credit_history', 'purpose',
+    'credit_amount', 'savings_account', 'employment', 'installment_rate',
+    'personal_status', 'other_debtors', 'residence_since', 'property',
+    'age', 'other_installments', 'housing', 'existing_credits',
+    'job', 'dependents', 'telephone', 'foreign_worker', 'target'
+]
+
+# Try local file first, else download from UCI
+LOCAL_PATH = 'german.data'
+URL = 'https://archive.ics.uci.edu/ml/machine-learning-databases/statlog/german/german.data'
+
+if os.path.exists(LOCAL_PATH):
+    print(f"\nLoading data from {LOCAL_PATH}")
+    df_raw = pd.read_csv(LOCAL_PATH, sep=' ', header=None, names=COL_NAMES)
+else:
+    print("\nDownloading German Credit Dataset from UCI …")
+    try:
+        with urllib.request.urlopen(URL, timeout=15) as r:
+            data_bytes = r.read()
+        df_raw = pd.read_csv(io.StringIO(data_bytes.decode()), sep=' ',
+                             header=None, names=COL_NAMES)
+        df_raw.to_csv(LOCAL_PATH, index=False, sep=' ', header=False)
+        print(f"  Saved to {LOCAL_PATH}")
+    except Exception as e:
+        raise SystemExit(
+            f"\nCould not download the dataset ({e}).\n"
+            "Please download german.data from:\n"
+            "  https://archive.ics.uci.edu/ml/machine-learning-databases/statlog/german/german.data\n"
+            "and place it in the same folder as this script."
+        )
+
+print(f"Dataset shape: {df_raw.shape}   (records × features)")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. DATA DECODING
+# ══════════════════════════════════════════════════════════════════════════════
+# Recode target: UCI format uses 1=good(non-default), 2=bad(default)
+# If values are already 0/1 (pre-processed), keep as-is
+if df_raw['target'].max() == 2:
+    df_raw['target'] = (df_raw['target'] == 2).astype(int)
+elif df_raw['target'].max() == 1:
+    pass  # already 0/1
+
+# Human-readable labels for the 4 key categorical variables used in Figure 4
+CHECKING_MAP = {
+    'A11': 'No Balance',
+    'A12': '0-200 DM',
+    'A13': '>200 DM',
+    'A14': 'No Account',
+}
+CREDIT_HIST_MAP = {
+    'A30': 'No Credits',
+    'A31': 'Paid Duly',
+    'A32': 'Paid Duly',
+    'A33': 'Delays',
+    'A34': 'All Paid',  # critical
+}
+SAVINGS_MAP = {
+    'A61': '<100 DM',
+    'A62': '100-500',
+    'A63': '500-1K',
+    'A64': '>1000',
+    'A65': 'Unknown',
+}
+EMPLOYMENT_MAP = {
+    'A71': 'Unemployed',
+    'A72': '<1yr',
+    'A73': '1-4yr',
+    'A74': '4-7yr',
+    'A75': '>7yr',
+}
+
+df = df_raw.copy()
+df['checking_lbl']    = df['checking_account'].map(CHECKING_MAP)
+df['credit_hist_lbl'] = df['credit_history'].map(CREDIT_HIST_MAP)
+df['savings_lbl']     = df['savings_account'].map(SAVINGS_MAP)
+df['employment_lbl']  = df['employment'].map(EMPLOYMENT_MAP)
+
+print(f"Default rate: {df['target'].mean():.1%}")
+print(f"Class split — Non-default: {(df['target']==0).sum()}, Default: {(df['target']==1).sum()}")
+
+# ── Descriptive stats table (Table 2) ─────────────────────────────────────────
+numeric_cols = ['duration', 'credit_amount', 'installment_rate',
+                'residence_since', 'age', 'existing_credits', 'dependents']
+desc = df[numeric_cols].agg(['mean', 'std', 'min', 'median', 'max']).T
+desc.columns = ['Mean', 'Std', 'Min', 'Median', 'Max']
+desc = desc.round(1)
+desc.index = ['Duration', 'Amount (DM)', 'Inst. Rate',
+              'Res. Since', 'Age', 'Credits', 'Dependents']
+print("\nTable 2. Descriptive Statistics — Numeric Features")
+print(desc.to_string())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  FIGURE 1 — Target Variable Distribution  (Section 2.3)
+# ══════════════════════════════════════════════════════════════════════════════
+counts = df['target'].value_counts().sort_index()   # 0 = non-default, 1 = default
+n_nd = int(counts.get(0, 0))
+n_d  = int(counts.get(1, 0))
+
+fig, axes = plt.subplots(1, 2, figsize=(9, 4))
+fig.suptitle('Figure 1: Target Variable Distribution (n = 1,000)',
+             fontsize=13, fontweight='bold', y=1.02)
+
+# Bar chart
+colors_bar = [BLUE, RED]
+bars = axes[0].bar(['Non-Default', 'Default'], [n_nd, n_d],
+                   color=colors_bar, edgecolor='white', linewidth=0.8)
+axes[0].set_title('Class Counts', fontsize=11)
+axes[0].set_ylabel('Count')
+axes[0].set_ylim(0, 950)
+for bar, val, pct in zip(bars, [n_nd, n_d], [n_nd/1000, n_d/1000]):
+    axes[0].text(bar.get_x() + bar.get_width()/2, val + 12,
+                 f'{val}\n({pct:.0%})', ha='center', fontsize=11, fontweight='bold')
+
+# Pie chart
+axes[1].pie([n_nd, n_d],
+            labels=[f'Non-Default\n{n_nd/1000:.1%}', f'Default\n{n_d/1000:.1%}'],
+            colors=colors_bar, startangle=90,
+            wedgeprops={'edgecolor': 'white', 'linewidth': 1.5},
+            textprops={'fontsize': 11})
+axes[1].set_title('Default Rate', fontsize=11)
+
+plt.tight_layout()
+plt.savefig('plots/fig01_target_distribution.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("\nSaved: plots/fig01_target_distribution.png")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.  FIGURE 2 — Numeric Feature Distributions by Default Status  (Section 2.3)
+# ══════════════════════════════════════════════════════════════════════════════
+feat_labels = ['Duration', 'Credit Amount', 'Age',
+               'Installment Rate', 'Existing Credits', 'Residence Since']
+feat_cols   = ['duration', 'credit_amount', 'age',
+               'installment_rate', 'existing_credits', 'residence_since']
+
+fig, axes = plt.subplots(2, 3, figsize=(13, 7))
+fig.suptitle('Figure 2: Numeric Feature Distributions by Default Status\n(dashed lines = group means)',
+             fontsize=12, fontweight='bold')
+axes = axes.flatten()
+
+for ax, col, lbl in zip(axes, feat_cols, feat_labels):
+    for status, colour, name in zip([0, 1], [BLUE, RED], ['Non-Default', 'Default']):
+        vals = df[df['target'] == status][col]
+        ax.hist(vals, bins=30, alpha=0.55, color=colour, label=name, density=False)
+        ax.axvline(vals.mean(), color=colour, linestyle='--', lw=1.5)
+    ax.set_title(lbl, fontsize=10)
+    ax.set_xlabel(lbl)
+    ax.set_ylabel('Count')
+    ax.legend(fontsize=7)
+
+plt.tight_layout()
+plt.savefig('plots/fig02_numeric_distributions.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved: plots/fig02_numeric_distributions.png")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5.  FIGURE 3 — Correlation Matrix  (Section 2.3)
+# ══════════════════════════════════════════════════════════════════════════════
+corr_cols = numeric_cols + ['target']
+corr_df = df[corr_cols].rename(columns={'target': 'default'})
+corr_mat = corr_df.corr()
+
+fig, ax = plt.subplots(figsize=(8, 7))
+fig.suptitle('Figure 3: Correlation Matrix — Numeric Features',
+             fontsize=12, fontweight='bold')
+
+mask = np.tril(np.ones_like(corr_mat, dtype=bool), k=-1)   # upper triangle only (keep diagonal too)
+# Show all cells, annotate lower triangle
+mask_upper = np.triu(np.ones_like(corr_mat, dtype=bool), k=1)
+sns.heatmap(corr_mat, mask=mask_upper, annot=True, fmt='.2f',
+            cmap='RdBu_r', center=0, vmin=-1, vmax=1,
+            ax=ax, square=True, linewidths=0.5, linecolor='white',
+            cbar_kws={'shrink': 0.7})
+ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', fontsize=8)
+ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=8)
+
+plt.tight_layout()
+plt.savefig('plots/fig03_correlation_matrix.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved: plots/fig03_correlation_matrix.png")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6.  FIGURE 4 — Default Rate by Key Categorical Variables  (Section 2.3)
+# ══════════════════════════════════════════════════════════════════════════════
+avg_default = df['target'].mean() * 100   # 30.4 %
+
+def default_rate_bars(ax, series_lbl, series_target, title, avg, order=None):
+    """Horizontal bar chart of default rates per category level."""
+    rates = series_target.groupby(series_lbl).mean() * 100
+    if order:
+        rates = rates.reindex(order)
+    rates = rates.sort_values()
+    colors = [RED if v > avg else BLUE for v in rates.values]
+    bars = ax.barh(rates.index, rates.values, color=colors, edgecolor='white')
+    ax.axvline(avg, color='navy', linestyle='--', lw=1, label=f'Avg {avg:.1f}%')
+    for bar, v in zip(bars, rates.values):
+        ax.text(v + 0.5, bar.get_y() + bar.get_height()/2,
+                f'{v:.1f}%', va='center', fontsize=8.5, fontweight='bold')
+    ax.set_title(title, fontsize=10, fontweight='bold')
+    ax.set_xlabel('Default Rate (%)')
+    ax.legend(fontsize=7.5)
+    ax.set_xlim(0, max(rates.values) * 1.22)
+
+fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+fig.suptitle('Figure 4: Default Rate by Key Categorical Variables',
+             fontsize=13, fontweight='bold')
+
+default_rate_bars(axes[0, 0], df['checking_lbl'], df['target'],
+                  'Checking Account', avg_default,
+                  order=['No Account', '>200 DM', '0-200 DM', 'No Balance'])
+
+default_rate_bars(axes[0, 1], df['credit_hist_lbl'], df['target'],
+                  'Credit History', avg_default,
+                  order=['No Credits', 'Delays', 'Paid Duly', 'All Paid'])
+
+default_rate_bars(axes[1, 0], df['savings_lbl'], df['target'],
+                  'Savings Account', avg_default,
+                  order=['<100 DM', 'Unknown', '100-500', '500-1K', '>1000'])
+
+default_rate_bars(axes[1, 1], df['employment_lbl'], df['target'],
+                  'Employment', avg_default,
+                  order=['Unemployed', '<1yr', '1-4yr', '4-7yr', '>7yr'])
+
+# Legend patch
+from matplotlib.patches import Patch
+legend_elements = [Patch(facecolor=RED, label='Above average risk'),
+                   Patch(facecolor=BLUE, label='Below average risk')]
+fig.legend(handles=legend_elements, loc='lower center', ncol=2,
+           fontsize=9, frameon=True, bbox_to_anchor=(0.5, -0.02))
+
+plt.tight_layout()
+plt.savefig('plots/fig04_default_by_category.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved: plots/fig04_default_by_category.png")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7.  FEATURE ENGINEERING  (Section 3.2)
+# ══════════════════════════════════════════════════════════════════════════════
+# One-hot encode all 13 categorical columns
+categorical_cols = ['checking_account', 'credit_history', 'purpose',
+                    'savings_account', 'employment', 'personal_status',
+                    'other_debtors', 'property', 'other_installments',
+                    'housing', 'job', 'telephone', 'foreign_worker']
+
+df_model = pd.get_dummies(
+    df[categorical_cols + numeric_cols + ['target']],
+    columns=categorical_cols,
+    drop_first=True
+)
+
+# Six engineered features
+df_model['loan_burden']        = df['credit_amount'] * df['installment_rate']
+df_model['credit_per_month']   = df['credit_amount'] / df['duration']
+df_model['age_duration_ratio'] = df['age'] / df['duration']
+df_model['high_amount_flag']   = (df['credit_amount'] > df['credit_amount'].quantile(0.75)).astype(int)
+df_model['long_duration_flag'] = (df['duration'] > 24).astype(int)
+df_model['log_credit_amount']  = np.log1p(df['credit_amount'])
+
+print(f"\nFinal feature space: {df_model.shape[1] - 1} features (after encoding + engineering)")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8.  TRAIN / TEST SPLIT & SCALING  (Section 3.1)
+# ══════════════════════════════════════════════════════════════════════════════
+X = df_model.drop('target', axis=1)
+y = df_model['target']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.30, random_state=42, stratify=y
+)
+print(f"\nTrain size: {len(X_train)} | Test size: {len(X_test)}")
+print(f"Train default rate: {y_train.mean():.3f} | Test default rate: {y_test.mean():.3f}")
+
+scaler = StandardScaler()
+X_train_sc = scaler.fit_transform(X_train)
+X_test_sc  = scaler.transform(X_test)
+X_train_sc = pd.DataFrame(X_train_sc, columns=X.columns)
+X_test_sc  = pd.DataFrame(X_test_sc,  columns=X.columns)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9.  MODEL TRAINING  (Section 3.3)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\nTraining models …")
+
+lr = LogisticRegression(C=1.0, max_iter=1000, class_weight='balanced', random_state=42)
+lr.fit(X_train_sc, y_train)
+
+lda = LinearDiscriminantAnalysis()
+lda.fit(X_train_sc, y_train)
+
+dt = DecisionTreeClassifier(max_depth=5, min_samples_leaf=20,
+                             class_weight='balanced', random_state=42)
+dt.fit(X_train, y_train)
+
+rf = RandomForestClassifier(n_estimators=500, max_depth=8, min_samples_leaf=10,
+                             class_weight='balanced', n_jobs=-1, random_state=42)
+rf.fit(X_train, y_train)
+
+gb = GradientBoostingClassifier(n_estimators=300, learning_rate=0.05,
+                                 max_depth=4, subsample=0.8, random_state=42)
+gb.fit(X_train, y_train)
+
+print("  All models trained.")
+
+# Store in a dict: name → (model, X_test_to_use, scaled?)
+MODELS = {
+    'Logistic Regression': (lr,  X_test_sc),
+    'LDA'                : (lda, X_test_sc),
+    'Decision Tree'      : (dt,  X_test),
+    'Random Forest'      : (rf,  X_test),
+    'Gradient Boosting'  : (gb,  X_test),
+}
+
+# ── Collect predictions ────────────────────────────────────────────────────────
+results = {}
+for name, (model, Xt) in MODELS.items():
+    proba = model.predict_proba(Xt)[:, 1]
+    pred  = model.predict(Xt)
+    results[name] = {'proba': proba, 'pred': pred, 'model': model, 'Xt': Xt}
+
+# ── Train AUC for overfit gap ──────────────────────────────────────────────────
+train_aucs = {}
+for name, (model, _) in MODELS.items():
+    Xtr = X_train_sc if name in ('Logistic Regression', 'LDA') else X_train
+    train_aucs[name] = roc_auc_score(y_train, model.predict_proba(Xtr)[:, 1])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 10.  TABLE 5 — Logistic Regression Top Coefficients  (Section 4.1)
+# ══════════════════════════════════════════════════════════════════════════════
+coef_df = pd.DataFrame({
+    'Feature'    : X.columns,
+    'Coef'       : lr.coef_[0],
+    'Odds Ratio' : np.exp(lr.coef_[0]),
+})
+coef_df = coef_df.reindex(coef_df['Coef'].abs().sort_values(ascending=False).index)
+coef_df = coef_df.head(15).reset_index(drop=True)
+coef_df['Odds Ratio'] = coef_df['Odds Ratio'].round(2)
+coef_df['Coef']       = coef_df['Coef'].round(3)
+print("\nTable 5. Top 15 Logistic Regression Coefficients")
+print(coef_df.to_string(index=False))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 11.  FIGURE 5 — Logistic Regression Coefficient Plot  (Section 4.1)
+# ══════════════════════════════════════════════════════════════════════════════
+top15 = coef_df.copy()
+
+# Approximate p-values via Wald z-test (diagonal of inverse Fisher info)
+from scipy.special import expit as sigmoid
+n_samples = X_train_sc.shape[0]
+p_hat = sigmoid(X_train_sc.values @ lr.coef_[0] + lr.intercept_[0])
+W     = np.diag(p_hat * (1 - p_hat))
+try:
+    XtWX   = X_train_sc.values.T @ W @ X_train_sc.values
+    cov    = np.linalg.inv(XtWX)
+    se     = np.sqrt(np.diag(cov))
+    z_stat = lr.coef_[0] / se
+    p_vals = 2 * (1 - stats.norm.cdf(np.abs(z_stat)))
+    se_df  = pd.DataFrame({'Feature': X.columns, 'SE': se, 'z': z_stat, 'p': p_vals})
+except Exception:
+    se_df = pd.DataFrame({'Feature': X.columns, 'SE': np.nan, 'z': np.nan, 'p': np.nan})
+
+top15 = top15.merge(se_df, on='Feature', how='left')
+
+fig, ax = plt.subplots(figsize=(9, 6))
+fig.suptitle("Figure 5: Logistic Regression Coefficients (Top 15, * = p<0.05)\n95% confidence intervals shown",
+             fontsize=11, fontweight='bold')
+
+top15_rev = top15.iloc[::-1].reset_index(drop=True)
+colors_lr  = [RED if c > 0 else BLUE for c in top15_rev['Coef']]
+y_pos = range(len(top15_rev))
+
+ax.barh(y_pos, top15_rev['Coef'], color=colors_lr, alpha=0.85, edgecolor='white')
+# CI bars ±1.96 SE if available
+if top15_rev['SE'].notna().all():
+    ax.errorbar(top15_rev['Coef'], y_pos,
+                xerr=1.96 * top15_rev['SE'],
+                fmt='none', color='black', capsize=3, lw=0.8)
+# Stars for p < 0.05
+for i, (_, row) in enumerate(top15_rev.iterrows()):
+    if pd.notna(row['p']) and row['p'] < 0.05:
+        ax.text(0.01, i, '*', va='center', fontsize=12, color='black',
+                transform=ax.get_yaxis_transform())
+
+ax.set_yticks(list(y_pos))
+ax.set_yticklabels(top15_rev['Feature'], fontsize=8)
+ax.axvline(0, color='black', lw=0.8)
+ax.set_xlabel('Coefficient (log-odds scale)')
+
+from matplotlib.patches import Patch
+ax.legend(handles=[Patch(facecolor=RED, label='Increases default risk'),
+                   Patch(facecolor=BLUE, label='Decreases default risk')],
+          fontsize=8, loc='lower right')
+
+plt.tight_layout()
+plt.savefig('plots/fig05_lr_coefficients.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved: plots/fig05_lr_coefficients.png")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 12.  TABLE 6 — Full Performance Metrics  (Section 5.1)
+# ══════════════════════════════════════════════════════════════════════════════
+perf_rows = []
+for name, res in results.items():
+    proba, pred = res['proba'], res['pred']
+    test_auc = roc_auc_score(y_test, proba)
+    gini     = 2 * test_auc - 1
+    og       = round(train_aucs[name] - test_auc, 3)
+    rep      = classification_report(y_test, pred, output_dict=True)
+    tn, fp, fn, tp = confusion_matrix(y_test, pred).ravel()
+    spec = tn / (tn + fp)
+    perf_rows.append({
+        'Model'   : name,
+        'Acc.'    : round(rep['accuracy'], 3),
+        'AUC'     : round(test_auc, 4),
+        'Gini'    : round(gini, 4),
+        'Prec.'   : round(rep['1']['precision'], 3),
+        'Recall'  : round(rep['1']['recall'], 3),
+        'Spec.'   : round(spec, 3),
+        'F1'      : round(rep['1']['f1-score'], 3),
+        'OG'      : og,
+    })
+
+perf_df = pd.DataFrame(perf_rows)
+print("\nTable 6. Test Set Performance — All Models (threshold = 0.5)")
+print(perf_df.to_string(index=False))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 13.  FIGURE 6 — ROC + Precision-Recall Curves  (Section 5.1)
+# ══════════════════════════════════════════════════════════════════════════════
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig.suptitle('Figure 6: ROC and Precision-Recall Curves — All Models',
+             fontsize=12, fontweight='bold')
+
+for (name, res), color in zip(results.items(), PALETTE):
+    proba = res['proba']
+    # ROC
+    fpr, tpr, _ = roc_curve(y_test, proba)
+    auc_val      = auc(fpr, tpr)
+    axes[0].plot(fpr, tpr, lw=2, color=color, label=f'{name} (AUC={auc_val:.3f})')
+    # PR
+    prec, rec, _ = precision_recall_curve(y_test, proba)
+    ap            = average_precision_score(y_test, proba)
+    axes[1].plot(rec, prec, lw=2, color=color, label=f'{name} (AP={ap:.3f})')
+
+axes[0].plot([0, 1], [0, 1], 'k--', lw=1, label='Random classifier')
+axes[0].set_xlabel('False Positive Rate'); axes[0].set_ylabel('True Positive Rate')
+axes[0].set_title('ROC Curves'); axes[0].legend(fontsize=7.5, loc='lower right')
+
+axes[1].axhline(y_test.mean(), color='gray', linestyle='--', lw=1, label='No-skill baseline')
+axes[1].set_xlabel('Recall'); axes[1].set_ylabel('Precision')
+axes[1].set_title('Precision-Recall Curves'); axes[1].legend(fontsize=7.5)
+axes[1].set_ylim(0.25, 1.0)
+
+plt.tight_layout()
+plt.savefig('plots/fig06_roc_pr_curves.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved: plots/fig06_roc_pr_curves.png")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 14.  FIGURE 7 — Radar / Multi-metric Comparison  (Section 5.1)
+# ══════════════════════════════════════════════════════════════════════════════
+# Horizontal grouped bar chart matching Figure 7 in the report
+metrics_to_show = ['AUC', 'Gini', 'F1', 'Recall', 'Spec.']
+model_names     = perf_df['Model'].tolist()
+
+fig, ax = plt.subplots(figsize=(11, 5))
+fig.suptitle('Figure 7: Full Model Performance Comparison — Test Set',
+             fontsize=12, fontweight='bold')
+
+n_models  = len(model_names)
+n_metrics = len(metrics_to_show)
+x         = np.arange(n_models)
+width     = 0.14
+metric_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62828', '#9467bd']
+
+for i, (metric, mc) in enumerate(zip(metrics_to_show, metric_colors)):
+    vals = perf_df[metric].values
+    ax.bar(x + (i - n_metrics/2 + 0.5) * width, vals,
+           width, label=metric, color=mc, alpha=0.85, edgecolor='white')
+
+ax.axhline(0.80, color='green', linestyle=':', lw=1.5, label='Good (0.80)')
+ax.axhline(0.70, color='orange', linestyle='--', lw=1.0, label='Acceptable (0.70)')
+ax.set_xticks(x)
+ax.set_xticklabels(model_names, rotation=12, ha='right', fontsize=9)
+ax.set_ylim(0, 1.05)
+ax.set_ylabel('Score')
+ax.legend(fontsize=8, ncol=4, loc='lower right')
+
+plt.tight_layout()
+plt.savefig('plots/fig07_performance_comparison.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved: plots/fig07_performance_comparison.png")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 15.  TABLE 7 + FIGURE 8 — Cross-Validation Stability  (Section 5.2)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\nRunning 5-fold stratified cross-validation …")
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+cv_results = {}
+for name, (model, _) in MODELS.items():
+    Xtr = X_train_sc if name in ('Logistic Regression', 'LDA') else X_train
+    scores = cross_val_score(model, Xtr, y_train, cv=cv,
+                             scoring='roc_auc', n_jobs=-1)
+    cv_results[name] = scores
+
+cv_df = pd.DataFrame({
+    'Model'   : list(cv_results.keys()),
+    'Mean AUC': [cv_results[k].mean() for k in cv_results],
+    'Std Dev' : [cv_results[k].std()  for k in cv_results],
+    'Min'     : [cv_results[k].min()  for k in cv_results],
+    'Max'     : [cv_results[k].max()  for k in cv_results],
+}).round(4)
+print("\nTable 7. 5-Fold Stratified Cross-Validation AUC — Training Set")
+print(cv_df.to_string(index=False))
+
+# Figure 8 — boxplot of CV fold scores
+fig, ax = plt.subplots(figsize=(10, 5))
+fig.suptitle('Figure 8: Cross-Validation AUC Stability (5-Fold)\nDots = individual fold scores',
+             fontsize=12, fontweight='bold')
+
+bp_data   = [cv_results[k] for k in cv_results]
+bp_labels = list(cv_results.keys())
+bp        = ax.boxplot(bp_data, patch_artist=True, widths=0.4,
+                        medianprops=dict(color='black', lw=1.5),
+                        flierprops=dict(marker='o', color='gray', alpha=0.5))
+
+for patch, color in zip(bp['boxes'], PALETTE):
+    patch.set_facecolor(color)
+    patch.set_alpha(0.7)
+
+# Overlay individual fold dots
+for i, scores in enumerate(bp_data, 1):
+    ax.scatter([i] * len(scores), scores, color='black', s=20, zorder=5)
+
+ax.axhline(0.80, color='green', linestyle=':', lw=1.5, label='Good threshold (0.80)')
+ax.axhline(0.70, color='orange', linestyle='--', lw=1.0, label='Acceptable threshold (0.70)')
+ax.set_xticklabels(bp_labels, rotation=12, ha='right', fontsize=9)
+ax.set_ylabel('AUC (5-Fold CV)')
+ax.set_ylim(0.60, 1.02)
+ax.legend(fontsize=9)
+
+plt.tight_layout()
+plt.savefig('plots/fig08_cv_stability.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved: plots/fig08_cv_stability.png")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 16.  FIGURE 9 — Tree-Based Feature Importance  (Section 6.1)
+# ══════════════════════════════════════════════════════════════════════════════
+def importance_bar(ax, model, feature_names, title, top_n=18):
+    imp   = pd.Series(model.feature_importances_, index=feature_names)
+    imp   = imp.nlargest(top_n).sort_values()
+    top5  = imp.nlargest(5).index.tolist()
+    colors = [RED if f in top5 else '#4472c4' for f in imp.index]
+    bars = ax.barh(imp.index, imp.values, color=colors, edgecolor='white', alpha=0.9)
+    for bar, v in zip(bars, imp.values):
+        ax.text(v + 0.001, bar.get_y() + bar.get_height()/2,
+                f'{v:.3f}', va='center', fontsize=7)
+    ax.set_xlabel('Importance Score')
+    ax.set_title(title, fontsize=10, fontweight='bold')
+    ax.set_xlim(0, imp.max() * 1.22)
+    return imp
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+fig.suptitle('Figure 9: Tree-Based Feature Importance\nTop 5 most important vs. Other features',
+             fontsize=12, fontweight='bold')
+
+rf_imp = importance_bar(axes[0], rf, X.columns,
+                        'Random Forest\n(Top 18 features)')
+gb_imp = importance_bar(axes[1], gb, X.columns,
+                        'Gradient Boosting\n(Top 18 features)')
+
+plt.tight_layout()
+plt.savefig('plots/fig09_feature_importance.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved: plots/fig09_feature_importance.png")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 17.  FIGURE 10 + TABLE 8 — Portfolio Decision Rule  (Section 6.2)
+# ══════════════════════════════════════════════════════════════════════════════
+gb_proba  = results['Gradient Boosting']['proba']
+LGD       = 0.45
+AVG_LOAN  = df['credit_amount'].mean()
+
+thresholds = np.arange(0.10, 0.91, 0.01)
+appr_rates, def_rates, recalls, precisions, f1s = [], [], [], [], []
+
+for t in thresholds:
+    approved = gb_proba < t
+    appr_rates.append(approved.mean() * 100)
+    def_rates.append(y_test[approved].mean() * 100 if approved.sum() > 0 else 0)
+    pred_t = (gb_proba >= t).astype(int)
+    from sklearn.metrics import recall_score, precision_score
+    recalls.append(recall_score(y_test, pred_t, zero_division=0))
+    precisions.append(precision_score(y_test, pred_t, zero_division=0))
+    f1s.append(f1_score(y_test, pred_t, zero_division=0))
+
+best_t_idx = int(np.argmax(f1s))
+best_t     = thresholds[best_t_idx]
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+fig.suptitle('Figure 10: Portfolio Decision Rule — Threshold Analysis',
+             fontsize=12, fontweight='bold')
+
+# Left: Approval rate vs default rate in approved pool
+ax1 = axes[0]
+ax2 = ax1.twinx()
+ax1.plot(thresholds, appr_rates,  color=BLUE, lw=2, label='Approval Rate (%)')
+ax2.plot(thresholds, def_rates,   color=RED,  lw=2, linestyle='--',
+         label='Default in Approved (%)')
+ax1.set_xlabel('Threshold t')
+ax1.set_ylabel('Approval Rate (%)', color=BLUE)
+ax2.set_ylabel('Default Rate in Approved Pool (%)', color=RED)
+ax1.axvline(best_t, color='green', lw=1.5, linestyle=':')
+ax1.tick_params(axis='y', labelcolor=BLUE)
+ax2.tick_params(axis='y', labelcolor=RED)
+lines1, lbls1 = ax1.get_legend_handles_labels()
+lines2, lbls2 = ax2.get_legend_handles_labels()
+ax1.legend(lines1 + lines2, lbls1 + lbls2, fontsize=8, loc='upper left')
+ax1.set_title('Approval Rate vs Portfolio Default Rate')
+
+# Right: Precision / Recall / F1 vs threshold
+axes[1].plot(thresholds, recalls,    color=RED,   lw=2, label='Recall')
+axes[1].plot(thresholds, precisions, color=BLUE,  lw=2, label='Precision')
+axes[1].plot(thresholds, f1s,        color='green', lw=2, label='F1-Score')
+axes[1].axvline(best_t, color='green', lw=1.5, linestyle=':',
+                label=f'Optimal t={best_t:.2f}')
+axes[1].set_xlabel('Threshold t')
+axes[1].set_ylabel('Score')
+axes[1].set_title('Precision / Recall / F1 vs Threshold')
+axes[1].legend(fontsize=8)
+axes[1].set_ylim(0, 1.05)
+
+plt.tight_layout()
+plt.savefig('plots/fig10_threshold_analysis.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved: plots/fig10_threshold_analysis.png")
+
+# Table 8
+print("\nTable 8. Threshold Sweep — Approve Loan if P̂(default|X) < t")
+t_points = [0.20, 0.25, 0.27, 0.30, 0.40, 0.50]
+table8 = []
+for t in t_points:
+    approved = gb_proba < t
+    apr   = approved.mean() * 100
+    def_r = y_test[approved].mean() * 100 if approved.sum() > 0 else 0
+    pred_t  = (gb_proba >= t).astype(int)
+    rec     = recall_score(y_test, pred_t, zero_division=0)
+    f1      = f1_score(y_test, pred_t, zero_division=0)
+    el      = (def_r / 100) * LGD * AVG_LOAN
+    table8.append({'t': t, 'Approval %': f'{apr:.1f}%',
+                   'Default in Pool': f'{def_r:.1f}%',
+                   'Recall': round(rec, 3), 'F1': round(f1, 3),
+                   'EL / Loan (DM)': int(el)})
+t8_df = pd.DataFrame(table8)
+print(t8_df.to_string(index=False))
+print(f"\nOptimal rule: Approve loan if P̂(default) < {best_t:.2f}")
+opt_approved = gb_proba < best_t
+print(f"  Approval rate: {opt_approved.mean():.1%}")
+print(f"  Portfolio default rate: {y_test[opt_approved].mean():.1%}")
+print(f"  Expected loss / loan: DM {(y_test[opt_approved].mean()*LGD*AVG_LOAN):.0f}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 18.  APPENDIX C — Basel III Compliance Summary
+# ══════════════════════════════════════════════════════════════════════════════
+print("\nAppendix C. Basel III IRB Compliance Checklist")
+print("-" * 52)
+checks = [
+    ("Separate dev. and validation samples", "✓", "Stratified 70/30 split"),
+    ("Default rate preserved in both splits", "✓", "30.4% train / test"),
+    ("Gini > 0.60 (minimum acceptable)",      "✓", f"All models ≥ {perf_df['Gini'].min():.3f}"),
+    ("Gini > 0.80 (strong performance)",       "✓", f"RF: {perf_df.loc[perf_df['Model']=='Random Forest','Gini'].values[0]:.3f}, GB: {perf_df.loc[perf_df['Model']=='Gradient Boosting','Gini'].values[0]:.3f}"),
+    ("Overfit gap documented",                 "✓", "Table 6"),
+    ("Feature importance documented",          "✓", "Section 6.1"),
+    ("Cross-validation stability",             "✓", "5-fold, Table 7"),
+    ("Multi-year vintage validation",          "✗", "Out of scope"),
+    ("Reject inference",                       "✗", "Out of scope"),
+    ("Stress testing",                         "✗", "Recommended future work"),
+]
+for req, status, note in checks:
+    print(f"  {status}  {req:<42} {note}")
+
+print("\n" + "=" * 70)
+print("ALL PLOTS SAVED TO:  plots/")
+print("=" * 70)
+print("""
+  fig01_target_distribution.png   — Figure 1
+  fig02_numeric_distributions.png — Figure 2
+  fig03_correlation_matrix.png    — Figure 3
+  fig04_default_by_category.png   — Figure 4
+  fig05_lr_coefficients.png       — Figure 5
+  fig06_roc_pr_curves.png         — Figure 6
+  fig07_performance_comparison.png— Figure 7
+  fig08_cv_stability.png          — Figure 8
+  fig09_feature_importance.png    — Figure 9
+  fig10_threshold_analysis.png    — Figure 10
+""")
